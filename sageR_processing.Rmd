@@ -1,0 +1,131 @@
+---
+title: "Proteomics (sageR minimal)"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Libraries
+```{r}
+suppressPackageStartupMessages({
+  library(sager)
+  library(QFeatures)
+  library(SummarizedExperiment)
+  library(preprocessCore)  # quantile normalization
+  library(ggplot2)
+  library(reshape2)
+  library(dplyr)
+  library(purrr)
+  library(gridExtra)
+})
+
+# (스레드 오류가 나면 preprocessCore를 스레드 비활성화로 재설치)
+# BiocManager::install("preprocessCore",
+#   configure.args = c(preprocessCore = "--disable-threading"),
+#   force=TRUE, update=TRUE, type="source")
+
+```
+
+# Paths
+```{r}
+id_path   <- "~/GC/Proteome/Pipeline/02.sage/Proteome/results.sage.tsv"
+quant_path<- "~/GC/Proteome/Pipeline/02.sage/Proteome/tmt.tsv"
+```
+
+# Load identifications & quant
+# Drop decoys/condtaminations
+```{r}
+# Load tables
+# NOTE: Large TSVs can take a while to load on first run. 
+id_tbl    <- read.delim(id_path,    sep = "\t")
+quant_tbl <- read.delim(quant_path, sep = "\t")
+
+# Flags for decoy/contaminant proteins
+is_decoy  <- grepl("^rev_", id_tbl$proteins)
+is_contam <- grepl("contam_|CON_|cont_", id_tbl$proteins, ignore.case = TRUE)
+
+# Keep only target, non-contaminant entries
+keep_idx  <- !(is_decoy | is_contam)
+id_tbl_f  <- id_tbl[keep_idx, ]
+
+# Remove corresponding scans from quant table (join by filename + scannr)
+to_drop <- id_tbl[!keep_idx, c("filename","scannr")]
+quant_tbl_f <- quant_tbl %>% anti_join(to_drop, by = c("filename","scannr"))
+```
+
+# Build QFeatures per file and process
+# Filter -> log -> normalize -> aggregate to proteins
+```{r}
+# Create a multi-assay QFeatures split by raw file; TMT columns start with 'user_'
+qf <- sageQFeatures(
+  quantTable   = quant_tbl_f,
+  idTable      = id_tbl_f,
+  byQuant      = c("filename","scannr"),
+  splitBy      = "filename",
+  quantPattern = "user_"
+)
+
+# Process a single-sample QFeatures:
+# - keep high-confidence PSMs (label>0, rank==1, q<0.01 at spectrum/peptide/protein)
+# - set zeros to NA, log-transform, quantile-normalize
+# - aggregate to protein using column medians
+process_one <- function(qf_one) {
+  qf_one %>%
+    filterFeatures(~ label > 0) %>%
+    filterFeatures(~ rank == 1) %>%
+    filterFeatures(~ spectrum_q < 0.01) %>%
+    filterFeatures(~ peptide_q  < 0.01) %>%
+    filterFeatures(~ protein_q  < 0.01) %>%
+    zeroIsNA(i = 1) %>%
+    logTransform(i = 1, name = "log_sage") %>%
+    normalize(i = "log_sage", name = "norm_sage", method = "quantiles") %>%
+    aggregateFeatures(
+      i     = "norm_sage",
+      name  = "proteins",
+      fcol  = "proteins",
+      fun   = matrixStats::colMedians,
+      na.rm = TRUE
+    )
+}
+
+# Apply to every split (each 'filename')
+qf_list <- setNames(
+  map(names(qf), function(nm) process_one(QFeatures(list(a1 = qf[[nm]])))),
+  names(qf)
+)
+```
+
+# QC heatmapsl; channel coreelations (PSM-normalize vs protein-aggregated)
+```{r}
+plot_corr_heatmap <- function(se, title_prefix = "") {
+  mat <- assay(se)
+  # Keep only channel suffix (remove file prefix if present)
+  colnames(mat) <- sub(".*\\.", "", colnames(mat))
+  cm  <- round(cor(mat, use = "pairwise.complete.obs", method = "pearson"), 3)
+  dd  <- melt(cm)
+  ggplot(dd, aes(Var1, Var2, fill = value)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.2f", value)), size = 3) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                         midpoint = 0.6, limits = c(0,1), name = "Pearson") +
+    coord_fixed() +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid = element_blank()) +
+    labs(title = paste0(title_prefix, " channel correlation"),
+         x = NULL, y = NULL)
+}
+
+# Draw both levels per sample
+invisible(lapply(names(qf_list), function(s){
+  g1 <- plot_corr_heatmap(qf_list[[s]][["norm_sage"]], paste0(s, " (PSM norm)"))
+  g2 <- plot_corr_heatmap(qf_list[[s]][["proteins"]], paste0(s, " (Protein agg)"))
+  grid.arrange(g1, g2, ncol = 2)
+}))
+```
+
+
